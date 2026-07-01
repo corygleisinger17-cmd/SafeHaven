@@ -18,7 +18,9 @@ alter table public.ai_insights enable row level security;
 alter table public.search_history enable row level security;
 alter table public.setup_wizard_progress enable row level security;
 
-
+-----------------------------------------------------------
+-- Profile Policies
+-----------------------------------------------------------
 
 create policy "Users can read own profile"
 on public.profiles
