@@ -17,3 +17,15 @@ alter table public.maintenance_history enable row level security;
 alter table public.ai_insights enable row level security;
 alter table public.search_history enable row level security;
 alter table public.setup_wizard_progress enable row level security;
+
+
+
+create policy "Users can read own profile"
+on public.profiles
+for select
+using (profile_id = auth.uid());
+
+create policy "Users can update own profile"
+on public.profiles
+for update
+using (profile_id = auth.uid());
