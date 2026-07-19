@@ -1,0 +1,273 @@
+begin;
+
+-- ============================================================
+-- SAFEHAVEN MIGRATION 012A
+-- Core Property RPC Functions
+-- ============================================================
+
+
+-- ============================================================
+-- 1. CREATE PROPERTY
+--
+-- Household members may create properties within households
+-- to which they belong.
+-- ============================================================
+
+create or replace function public.create_property(
+  p_household_id uuid,
+  p_property_name text,
+  p_property_type text default 'primary',
+  p_city text default null,
+  p_state text default null,
+  p_year_built integer default null
+)
+returns public.properties
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_property public.properties;
+begin
+  if auth.uid() is null then
+    raise exception using
+      errcode = '42501',
+      message = 'Authentication is required.';
+  end if;
+
+  if p_household_id is null then
+    raise exception using
+      errcode = '22004',
+      message = 'Household ID is required.';
+  end if;
+
+  if not public.is_household_member(p_household_id) then
+    raise exception using
+      errcode = '42501',
+      message = 'You are not authorized to create a property for this household.';
+  end if;
+
+  if p_property_name is null
+     or length(btrim(p_property_name)) = 0 then
+    raise exception using
+      errcode = '22023',
+      message = 'Property name is required.';
+  end if;
+
+  if p_property_type is null
+     or length(btrim(p_property_type)) = 0 then
+    raise exception using
+      errcode = '22023',
+      message = 'Property type is required.';
+  end if;
+
+  insert into public.properties (
+    household_id,
+    property_name,
+    property_type,
+    city,
+    state,
+    year_built
+  )
+  values (
+    p_household_id,
+    btrim(p_property_name),
+    lower(btrim(p_property_type)),
+    nullif(btrim(p_city), ''),
+    nullif(btrim(p_state), ''),
+    p_year_built
+  )
+  returning *
+  into v_property;
+
+  return v_property;
+end;
+$$;
+
+
+-- ============================================================
+-- 2. UPDATE PROPERTY
+--
+-- Household members may update properties they can access.
+-- The frontend sends the complete editable property record.
+-- ============================================================
+
+create or replace function public.update_property(
+  p_property_id uuid,
+  p_property_name text,
+  p_property_type text,
+  p_city text default null,
+  p_state text default null,
+  p_year_built integer default null
+)
+returns public.properties
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_property public.properties;
+begin
+  if auth.uid() is null then
+    raise exception using
+      errcode = '42501',
+      message = 'Authentication is required.';
+  end if;
+
+  if p_property_id is null then
+    raise exception using
+      errcode = '22004',
+      message = 'Property ID is required.';
+  end if;
+
+  if not exists (
+    select 1
+    from public.properties
+    where property_id = p_property_id
+  ) then
+    raise exception using
+      errcode = 'P0002',
+      message = 'Property not found.';
+  end if;
+
+  if not public.is_property_member(p_property_id) then
+    raise exception using
+      errcode = '42501',
+      message = 'You are not authorized to update this property.';
+  end if;
+
+  if p_property_name is null
+     or length(btrim(p_property_name)) = 0 then
+    raise exception using
+      errcode = '22023',
+      message = 'Property name is required.';
+  end if;
+
+  if p_property_type is null
+     or length(btrim(p_property_type)) = 0 then
+    raise exception using
+      errcode = '22023',
+      message = 'Property type is required.';
+  end if;
+
+  update public.properties
+  set
+    property_name = btrim(p_property_name),
+    property_type = lower(btrim(p_property_type)),
+    city = nullif(btrim(p_city), ''),
+    state = nullif(btrim(p_state), ''),
+    year_built = p_year_built
+  where property_id = p_property_id
+  returning *
+  into v_property;
+
+  return v_property;
+end;
+$$;
+
+
+-- ============================================================
+-- 3. DELETE PROPERTY
+--
+-- Only the household owner may delete an entire property.
+-- Related rooms, items, and records follow the foreign-key
+-- deletion rules already established in the schema.
+-- ============================================================
+
+create or replace function public.delete_property(
+  p_property_id uuid
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_household_id uuid;
+begin
+  if auth.uid() is null then
+    raise exception using
+      errcode = '42501',
+      message = 'Authentication is required.';
+  end if;
+
+  if p_property_id is null then
+    raise exception using
+      errcode = '22004',
+      message = 'Property ID is required.';
+  end if;
+
+  select household_id
+  into v_household_id
+  from public.properties
+  where property_id = p_property_id;
+
+  if v_household_id is null then
+    raise exception using
+      errcode = 'P0002',
+      message = 'Property not found.';
+  end if;
+
+  if not public.is_household_owner(v_household_id) then
+    raise exception using
+      errcode = '42501',
+      message = 'Only the household owner may delete a property.';
+  end if;
+
+  delete from public.properties
+  where property_id = p_property_id;
+
+  return found;
+end;
+$$;
+
+
+-- ============================================================
+-- 4. FUNCTION PERMISSIONS
+-- ============================================================
+
+revoke all on function public.create_property(
+  uuid,
+  text,
+  text,
+  text,
+  text,
+  integer
+) from public;
+
+revoke all on function public.update_property(
+  uuid,
+  text,
+  text,
+  text,
+  text,
+  integer
+) from public;
+
+revoke all on function public.delete_property(uuid)
+from public;
+
+
+grant execute on function public.create_property(
+  uuid,
+  text,
+  text,
+  text,
+  text,
+  integer
+) to authenticated;
+
+grant execute on function public.update_property(
+  uuid,
+  text,
+  text,
+  text,
+  text,
+  integer
+) to authenticated;
+
+grant execute on function public.delete_property(uuid)
+to authenticated;
+
+
+commit;
