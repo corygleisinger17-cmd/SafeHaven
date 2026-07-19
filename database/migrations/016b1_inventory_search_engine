@@ -1,0 +1,365 @@
+begin;
+
+-- ============================================================
+-- SAFEHAVEN MIGRATION 016B1
+-- Flexible Inventory Search Engine
+-- ============================================================
+
+create or replace function public.search_items(
+  p_search_text text default null,
+  p_property_id uuid default null,
+  p_room_id uuid default null,
+  p_category text default null,
+  p_include_deleted boolean default false,
+  p_sort_by text default 'updated_desc',
+  p_limit_count integer default 25,
+  p_offset_count integer default 0
+)
+returns jsonb
+language plpgsql
+security definer
+stable
+set search_path = pg_catalog, public
+as $$
+declare
+  v_user_id uuid;
+  v_room_property_id uuid;
+  v_total_count bigint;
+  v_items jsonb;
+  v_limit integer;
+  v_offset integer;
+  v_search_text text;
+  v_category text;
+begin
+  -- ==========================================================
+  -- 1. AUTHENTICATION
+  -- ==========================================================
+
+  v_user_id := public.require_authenticated_user();
+
+
+  -- ==========================================================
+  -- 2. NORMALIZE INPUTS
+  -- ==========================================================
+
+  v_search_text := nullif(btrim(p_search_text), '');
+  v_category := nullif(btrim(p_category), '');
+
+  v_limit := least(greatest(coalesce(p_limit_count, 25), 1), 100);
+  v_offset := greatest(coalesce(p_offset_count, 0), 0);
+
+
+  -- ==========================================================
+  -- 3. VALIDATE SORT OPTION
+  -- ==========================================================
+
+  if coalesce(p_sort_by, '') not in (
+    'name_asc',
+    'name_desc',
+    'created_asc',
+    'created_desc',
+    'updated_asc',
+    'updated_desc',
+    'purchase_asc',
+    'purchase_desc'
+  ) then
+    raise exception using
+      errcode = '22023',
+      message = 'Invalid sort option.';
+  end if;
+
+
+  -- ==========================================================
+  -- 4. VALIDATE PROPERTY ACCESS
+  -- ==========================================================
+
+  if p_property_id is not null then
+    perform public.require_property_access(p_property_id);
+  end if;
+
+
+  -- ==========================================================
+  -- 5. VALIDATE ROOM
+  -- ==========================================================
+
+  if p_room_id is not null then
+    select property_id
+    into v_room_property_id
+    from public.rooms
+    where room_id = p_room_id;
+
+    if not found then
+      raise exception using
+        errcode = 'P0002',
+        message = 'Room not found.';
+    end if;
+
+    perform public.require_property_access(v_room_property_id);
+
+    if p_property_id is not null
+       and v_room_property_id <> p_property_id then
+      raise exception using
+        errcode = '22023',
+        message = 'The selected room does not belong to the selected property.';
+    end if;
+  end if;
+
+
+  -- ==========================================================
+  -- 6. COUNT ALL MATCHING ITEMS
+  --
+  -- Count is calculated before pagination.
+  -- ==========================================================
+
+  select count(*)
+  into v_total_count
+  from public.items i
+  left join public.properties p
+    on p.property_id = i.property_id
+  left join public.rooms r
+    on r.room_id = i.room_id
+  where public.is_household_member(i.household_id)
+    and (
+      p_include_deleted = true
+      or i.is_deleted = false
+    )
+    and (
+      p_property_id is null
+      or i.property_id = p_property_id
+    )
+    and (
+      p_room_id is null
+      or i.room_id = p_room_id
+    )
+    and (
+      v_category is null
+      or lower(i.category) = lower(v_category)
+    )
+    and (
+      v_search_text is null
+      or i.item_name ilike '%' || v_search_text || '%'
+      or i.category ilike '%' || v_search_text || '%'
+      or i.brand ilike '%' || v_search_text || '%'
+      or i.model_number ilike '%' || v_search_text || '%'
+      or i.serial_number ilike '%' || v_search_text || '%'
+      or i.vendor ilike '%' || v_search_text || '%'
+      or i.notes ilike '%' || v_search_text || '%'
+      or i.item_condition ilike '%' || v_search_text || '%'
+      or p.property_name ilike '%' || v_search_text || '%'
+      or r.room_name ilike '%' || v_search_text || '%'
+    );
+
+
+  -- ==========================================================
+  -- 7. FETCH PAGINATED RESULTS
+  -- ==========================================================
+
+  with matching_items as (
+    select
+      i.item_id,
+      i.household_id,
+      i.property_id,
+      p.property_name,
+      i.room_id,
+      r.room_name,
+      i.item_name,
+      i.category,
+      i.brand,
+      i.model_number,
+      i.serial_number,
+      i.purchase_date,
+      i.purchase_price,
+      i.vendor,
+      i.warranty_start,
+      i.warranty_expiration,
+      i.item_condition,
+      i.notes,
+      i.primary_photo_url,
+      i.ai_confidence_score,
+      i.is_deleted,
+      i.deleted_at,
+      i.deleted_by,
+      i.created_at,
+      i.updated_at
+    from public.items i
+    left join public.properties p
+      on p.property_id = i.property_id
+    left join public.rooms r
+      on r.room_id = i.room_id
+    where public.is_household_member(i.household_id)
+      and (
+        p_include_deleted = true
+        or i.is_deleted = false
+      )
+      and (
+        p_property_id is null
+        or i.property_id = p_property_id
+      )
+      and (
+        p_room_id is null
+        or i.room_id = p_room_id
+      )
+      and (
+        v_category is null
+        or lower(i.category) = lower(v_category)
+      )
+      and (
+        v_search_text is null
+        or i.item_name ilike '%' || v_search_text || '%'
+        or i.category ilike '%' || v_search_text || '%'
+        or i.brand ilike '%' || v_search_text || '%'
+        or i.model_number ilike '%' || v_search_text || '%'
+        or i.serial_number ilike '%' || v_search_text || '%'
+        or i.vendor ilike '%' || v_search_text || '%'
+        or i.notes ilike '%' || v_search_text || '%'
+        or i.item_condition ilike '%' || v_search_text || '%'
+        or p.property_name ilike '%' || v_search_text || '%'
+        or r.room_name ilike '%' || v_search_text || '%'
+      )
+    order by
+      case
+        when p_sort_by = 'name_asc'
+        then lower(i.item_name)
+      end asc nulls last,
+
+      case
+        when p_sort_by = 'name_desc'
+        then lower(i.item_name)
+      end desc nulls last,
+
+      case
+        when p_sort_by = 'created_asc'
+        then i.created_at
+      end asc nulls last,
+
+      case
+        when p_sort_by = 'created_desc'
+        then i.created_at
+      end desc nulls last,
+
+      case
+        when p_sort_by = 'updated_asc'
+        then i.updated_at
+      end asc nulls last,
+
+      case
+        when p_sort_by = 'updated_desc'
+        then i.updated_at
+      end desc nulls last,
+
+      case
+        when p_sort_by = 'purchase_asc'
+        then i.purchase_date
+      end asc nulls last,
+
+      case
+        when p_sort_by = 'purchase_desc'
+        then i.purchase_date
+      end desc nulls last,
+
+      -- Stable tie-breaker for pagination
+      i.item_id asc
+    limit v_limit
+    offset v_offset
+  )
+  select coalesce(
+    jsonb_agg(
+      jsonb_build_object(
+        'item_id', item_id,
+        'household_id', household_id,
+        'property_id', property_id,
+        'property_name', property_name,
+        'room_id', room_id,
+        'room_name', room_name,
+        'item_name', item_name,
+        'category', category,
+        'brand', brand,
+        'model_number', model_number,
+        'serial_number', serial_number,
+        'purchase_date', purchase_date,
+        'purchase_price', purchase_price,
+        'vendor', vendor,
+        'warranty_start', warranty_start,
+        'warranty_expiration', warranty_expiration,
+        'item_condition', item_condition,
+        'notes', notes,
+        'primary_photo_url', primary_photo_url,
+        'ai_confidence_score', ai_confidence_score,
+        'is_deleted', is_deleted,
+        'deleted_at', deleted_at,
+        'deleted_by', deleted_by,
+        'created_at', created_at,
+        'updated_at', updated_at
+      )
+    ),
+    '[]'::jsonb
+  )
+  into v_items
+  from matching_items;
+
+
+  -- ==========================================================
+  -- 8. STANDARDIZED JSON RESPONSE
+  -- ==========================================================
+
+  return jsonb_build_object(
+    'success', true,
+    'message',
+      case
+        when v_total_count = 0
+          then 'No matching items found.'
+        else 'Search completed successfully.'
+      end,
+    'count', v_total_count,
+    'returned_count', jsonb_array_length(v_items),
+    'limit', v_limit,
+    'offset', v_offset,
+    'has_more', (v_offset + jsonb_array_length(v_items)) < v_total_count,
+    'next_offset',
+      case
+        when (v_offset + jsonb_array_length(v_items)) < v_total_count
+          then v_offset + v_limit
+        else null
+      end,
+    'sort_by', p_sort_by,
+    'filters', jsonb_build_object(
+      'search_text', v_search_text,
+      'property_id', p_property_id,
+      'room_id', p_room_id,
+      'category', v_category,
+      'include_deleted', p_include_deleted
+    ),
+    'data', v_items
+  );
+end;
+$$;
+
+
+-- ============================================================
+-- 9. FUNCTION PERMISSIONS
+-- ============================================================
+
+revoke all on function public.search_items(
+  text,
+  uuid,
+  uuid,
+  text,
+  boolean,
+  text,
+  integer,
+  integer
+) from public;
+
+grant execute on function public.search_items(
+  text,
+  uuid,
+  uuid,
+  text,
+  boolean,
+  text,
+  integer,
+  integer
+) to authenticated;
+
+
+commit;
