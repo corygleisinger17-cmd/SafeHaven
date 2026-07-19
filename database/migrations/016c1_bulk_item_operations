@@ -1,0 +1,347 @@
+begin;
+
+-- ============================================================
+-- SAFEHAVEN MIGRATION 016C1
+-- Bulk Item Lifecycle Operations
+-- ============================================================
+--
+-- Adds:
+--   1. bulk_move_items()
+--   2. bulk_soft_delete_items()
+--   3. bulk_restore_items()
+--
+-- Design:
+--   • Authenticated users only
+--   • Reuses existing secure item lifecycle RPCs
+--   • Removes duplicate item IDs
+--   • Rejects null IDs
+--   • Maximum 250 unique items per operation
+--   • Executes atomically
+--   • Returns standardized JSON
+-- ============================================================
+
+
+-- ============================================================
+-- 1. BULK MOVE ITEMS
+-- ============================================================
+
+create or replace function public.bulk_move_items(
+  p_item_ids uuid[],
+  p_target_property_id uuid,
+  p_target_room_id uuid default null
+)
+returns jsonb
+language plpgsql
+security definer
+volatile
+set search_path = pg_catalog, public
+as $$
+declare
+  v_item_ids uuid[];
+  v_item_id uuid;
+  v_item public.items%rowtype;
+
+  v_requested_count integer;
+  v_unique_count integer;
+  v_results jsonb := '[]'::jsonb;
+begin
+  -- Authentication is also enforced by move_item(), but is
+  -- checked here so malformed requests fail consistently.
+  perform public.require_authenticated_user();
+
+  if p_item_ids is null
+     or cardinality(p_item_ids) = 0 then
+    raise exception using
+      errcode = '22023',
+      message = 'At least one item ID is required.';
+  end if;
+
+  if array_position(p_item_ids, null) is not null then
+    raise exception using
+      errcode = '22004',
+      message = 'Item ID list cannot contain null values.';
+  end if;
+
+  if p_target_property_id is null then
+    raise exception using
+      errcode = '22004',
+      message = 'Target property ID is required.';
+  end if;
+
+  v_requested_count := cardinality(p_item_ids);
+
+  select array_agg(item_id order by item_id)
+  into v_item_ids
+  from (
+    select distinct unnest(p_item_ids) as item_id
+  ) unique_items;
+
+  v_unique_count := cardinality(v_item_ids);
+
+  if v_unique_count > 250 then
+    raise exception using
+      errcode = '54000',
+      message = 'Bulk operations are limited to 250 unique items.';
+  end if;
+
+  -- Validate destination access before processing the batch.
+  perform public.require_property_access(p_target_property_id);
+
+  if p_target_room_id is not null then
+    if not exists (
+      select 1
+      from public.rooms r
+      where r.room_id = p_target_room_id
+        and r.property_id = p_target_property_id
+    ) then
+      raise exception using
+        errcode = '22023',
+        message = 'The target room does not belong to the target property.';
+    end if;
+  end if;
+
+  -- move_item() performs the complete item-level authorization
+  -- and household-boundary validation for each item.
+  foreach v_item_id in array v_item_ids
+  loop
+    select *
+    into v_item
+    from public.move_item(
+      v_item_id,
+      p_target_property_id,
+      p_target_room_id
+    );
+
+    v_results :=
+      v_results || jsonb_build_array(to_jsonb(v_item));
+  end loop;
+
+  return jsonb_build_object(
+    'success', true,
+    'message',
+      case
+        when v_unique_count = 1 then
+          'Item moved successfully.'
+        else
+          v_unique_count || ' items moved successfully.'
+      end,
+    'operation', 'bulk_move',
+    'requested_count', v_requested_count,
+    'processed_count', v_unique_count,
+    'duplicate_ids_removed',
+      v_requested_count - v_unique_count,
+    'target', jsonb_build_object(
+      'property_id', p_target_property_id,
+      'room_id', p_target_room_id
+    ),
+    'data', v_results
+  );
+end;
+$$;
+
+
+-- ============================================================
+-- 2. BULK SOFT DELETE ITEMS
+-- ============================================================
+
+create or replace function public.bulk_soft_delete_items(
+  p_item_ids uuid[]
+)
+returns jsonb
+language plpgsql
+security definer
+volatile
+set search_path = pg_catalog, public
+as $$
+declare
+  v_item_ids uuid[];
+  v_item_id uuid;
+  v_item public.items%rowtype;
+
+  v_requested_count integer;
+  v_unique_count integer;
+  v_results jsonb := '[]'::jsonb;
+begin
+  perform public.require_authenticated_user();
+
+  if p_item_ids is null
+     or cardinality(p_item_ids) = 0 then
+    raise exception using
+      errcode = '22023',
+      message = 'At least one item ID is required.';
+  end if;
+
+  if array_position(p_item_ids, null) is not null then
+    raise exception using
+      errcode = '22004',
+      message = 'Item ID list cannot contain null values.';
+  end if;
+
+  v_requested_count := cardinality(p_item_ids);
+
+  select array_agg(item_id order by item_id)
+  into v_item_ids
+  from (
+    select distinct unnest(p_item_ids) as item_id
+  ) unique_items;
+
+  v_unique_count := cardinality(v_item_ids);
+
+  if v_unique_count > 250 then
+    raise exception using
+      errcode = '54000',
+      message = 'Bulk operations are limited to 250 unique items.';
+  end if;
+
+  -- soft_delete_item() performs item-level authorization and
+  -- records deleted_at and deleted_by.
+  foreach v_item_id in array v_item_ids
+  loop
+    select *
+    into v_item
+    from public.soft_delete_item(v_item_id);
+
+    v_results :=
+      v_results || jsonb_build_array(to_jsonb(v_item));
+  end loop;
+
+  return jsonb_build_object(
+    'success', true,
+    'message',
+      case
+        when v_unique_count = 1 then
+          'Item archived successfully.'
+        else
+          v_unique_count || ' items archived successfully.'
+      end,
+    'operation', 'bulk_soft_delete',
+    'requested_count', v_requested_count,
+    'processed_count', v_unique_count,
+    'duplicate_ids_removed',
+      v_requested_count - v_unique_count,
+    'data', v_results
+  );
+end;
+$$;
+
+
+-- ============================================================
+-- 3. BULK RESTORE ITEMS
+-- ============================================================
+
+create or replace function public.bulk_restore_items(
+  p_item_ids uuid[]
+)
+returns jsonb
+language plpgsql
+security definer
+volatile
+set search_path = pg_catalog, public
+as $$
+declare
+  v_item_ids uuid[];
+  v_item_id uuid;
+  v_item public.items%rowtype;
+
+  v_requested_count integer;
+  v_unique_count integer;
+  v_results jsonb := '[]'::jsonb;
+begin
+  perform public.require_authenticated_user();
+
+  if p_item_ids is null
+     or cardinality(p_item_ids) = 0 then
+    raise exception using
+      errcode = '22023',
+      message = 'At least one item ID is required.';
+  end if;
+
+  if array_position(p_item_ids, null) is not null then
+    raise exception using
+      errcode = '22004',
+      message = 'Item ID list cannot contain null values.';
+  end if;
+
+  v_requested_count := cardinality(p_item_ids);
+
+  select array_agg(item_id order by item_id)
+  into v_item_ids
+  from (
+    select distinct unnest(p_item_ids) as item_id
+  ) unique_items;
+
+  v_unique_count := cardinality(v_item_ids);
+
+  if v_unique_count > 250 then
+    raise exception using
+      errcode = '54000',
+      message = 'Bulk operations are limited to 250 unique items.';
+  end if;
+
+  -- restore_item() performs item-level authorization and clears
+  -- the soft-delete metadata.
+  foreach v_item_id in array v_item_ids
+  loop
+    select *
+    into v_item
+    from public.restore_item(v_item_id);
+
+    v_results :=
+      v_results || jsonb_build_array(to_jsonb(v_item));
+  end loop;
+
+  return jsonb_build_object(
+    'success', true,
+    'message',
+      case
+        when v_unique_count = 1 then
+          'Item restored successfully.'
+        else
+          v_unique_count || ' items restored successfully.'
+      end,
+    'operation', 'bulk_restore',
+    'requested_count', v_requested_count,
+    'processed_count', v_unique_count,
+    'duplicate_ids_removed',
+      v_requested_count - v_unique_count,
+    'data', v_results
+  );
+end;
+$$;
+
+
+-- ============================================================
+-- 4. FUNCTION PERMISSIONS
+-- ============================================================
+
+revoke all on function public.bulk_move_items(
+  uuid[],
+  uuid,
+  uuid
+) from public;
+
+revoke all on function public.bulk_soft_delete_items(
+  uuid[]
+) from public;
+
+revoke all on function public.bulk_restore_items(
+  uuid[]
+) from public;
+
+
+grant execute on function public.bulk_move_items(
+  uuid[],
+  uuid,
+  uuid
+) to authenticated;
+
+grant execute on function public.bulk_soft_delete_items(
+  uuid[]
+) to authenticated;
+
+grant execute on function public.bulk_restore_items(
+  uuid[]
+) to authenticated;
+
+
+commit;
