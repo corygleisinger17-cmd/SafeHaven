@@ -1,0 +1,521 @@
+begin;
+
+-- ============================================================
+-- SAFEHAVEN MIGRATION 016A
+-- Core Item Lifecycle RPC Functions
+-- ============================================================
+
+
+-- ============================================================
+-- 1. CREATE ITEM
+--
+-- Creates an active inventory item.
+-- household_id is derived from the selected property rather
+-- than trusted from the frontend.
+-- ============================================================
+
+create or replace function public.create_item(
+  p_property_id uuid,
+  p_item_name text,
+  p_room_id uuid default null,
+  p_category text default null,
+  p_brand text default null,
+  p_model_number text default null,
+  p_serial_number text default null,
+  p_purchase_date date default null,
+  p_purchase_price numeric default null,
+  p_vendor text default null,
+  p_warranty_start date default null,
+  p_warranty_expiration date default null,
+  p_item_condition text default null,
+  p_notes text default null,
+  p_primary_photo_url text default null,
+  p_ai_confidence_score numeric default null
+)
+returns public.items
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_household_id uuid;
+  v_item public.items;
+begin
+  perform public.require_authenticated_user();
+  perform public.require_property_access(p_property_id);
+
+  if p_item_name is null
+     or length(btrim(p_item_name)) = 0 then
+    raise exception using
+      errcode = '22023',
+      message = 'Item name is required.';
+  end if;
+
+  select household_id
+  into v_household_id
+  from public.properties
+  where property_id = p_property_id;
+
+  if p_room_id is not null
+     and not exists (
+       select 1
+       from public.rooms
+       where room_id = p_room_id
+         and property_id = p_property_id
+     ) then
+    raise exception using
+      errcode = '22023',
+      message = 'The selected room does not belong to this property.';
+  end if;
+
+  insert into public.items (
+    household_id,
+    property_id,
+    room_id,
+    item_name,
+    category,
+    brand,
+    model_number,
+    serial_number,
+    purchase_date,
+    purchase_price,
+    vendor,
+    warranty_start,
+    warranty_expiration,
+    item_condition,
+    notes,
+    primary_photo_url,
+    ai_confidence_score,
+    is_deleted,
+    deleted_at,
+    deleted_by
+  )
+  values (
+    v_household_id,
+    p_property_id,
+    p_room_id,
+    btrim(p_item_name),
+    nullif(btrim(p_category), ''),
+    nullif(btrim(p_brand), ''),
+    nullif(btrim(p_model_number), ''),
+    nullif(btrim(p_serial_number), ''),
+    p_purchase_date,
+    p_purchase_price,
+    nullif(btrim(p_vendor), ''),
+    p_warranty_start,
+    p_warranty_expiration,
+    nullif(lower(btrim(p_item_condition)), ''),
+    nullif(btrim(p_notes), ''),
+    nullif(btrim(p_primary_photo_url), ''),
+    p_ai_confidence_score,
+    false,
+    null,
+    null
+  )
+  returning *
+  into v_item;
+
+  return v_item;
+end;
+$$;
+
+
+-- ============================================================
+-- 2. UPDATE ITEM
+--
+-- Updates the editable item details.
+-- This function does not move an item to another property.
+-- Use move_item() for location changes.
+-- ============================================================
+
+create or replace function public.update_item(
+  p_item_id uuid,
+  p_item_name text,
+  p_category text default null,
+  p_brand text default null,
+  p_model_number text default null,
+  p_serial_number text default null,
+  p_purchase_date date default null,
+  p_purchase_price numeric default null,
+  p_vendor text default null,
+  p_warranty_start date default null,
+  p_warranty_expiration date default null,
+  p_item_condition text default null,
+  p_notes text default null,
+  p_primary_photo_url text default null,
+  p_ai_confidence_score numeric default null
+)
+returns public.items
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_property_id uuid;
+  v_is_deleted boolean;
+  v_item public.items;
+begin
+  perform public.require_authenticated_user();
+
+  if p_item_id is null then
+    raise exception using
+      errcode = '22004',
+      message = 'Item ID is required.';
+  end if;
+
+  select property_id, is_deleted
+  into v_property_id, v_is_deleted
+  from public.items
+  where item_id = p_item_id;
+
+  if not found then
+    raise exception using
+      errcode = 'P0002',
+      message = 'Item not found.';
+  end if;
+
+  perform public.require_property_access(v_property_id);
+
+  if v_is_deleted then
+    raise exception using
+      errcode = '55000',
+      message = 'Deleted items must be restored before they can be updated.';
+  end if;
+
+  if p_item_name is null
+     or length(btrim(p_item_name)) = 0 then
+    raise exception using
+      errcode = '22023',
+      message = 'Item name is required.';
+  end if;
+
+  update public.items
+  set
+    item_name = btrim(p_item_name),
+    category = nullif(btrim(p_category), ''),
+    brand = nullif(btrim(p_brand), ''),
+    model_number = nullif(btrim(p_model_number), ''),
+    serial_number = nullif(btrim(p_serial_number), ''),
+    purchase_date = p_purchase_date,
+    purchase_price = p_purchase_price,
+    vendor = nullif(btrim(p_vendor), ''),
+    warranty_start = p_warranty_start,
+    warranty_expiration = p_warranty_expiration,
+    item_condition = nullif(lower(btrim(p_item_condition)), ''),
+    notes = nullif(btrim(p_notes), ''),
+    primary_photo_url = nullif(btrim(p_primary_photo_url), ''),
+    ai_confidence_score = p_ai_confidence_score
+  where item_id = p_item_id
+  returning *
+  into v_item;
+
+  return v_item;
+end;
+$$;
+
+
+-- ============================================================
+-- 3. MOVE ITEM
+--
+-- Moves an item to another room or property.
+-- The target room must belong to the target property.
+-- Moving between households is intentionally prohibited.
+-- ============================================================
+
+create or replace function public.move_item(
+  p_item_id uuid,
+  p_target_property_id uuid,
+  p_target_room_id uuid default null
+)
+returns public.items
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_source_property_id uuid;
+  v_source_household_id uuid;
+  v_target_household_id uuid;
+  v_is_deleted boolean;
+  v_item public.items;
+begin
+  perform public.require_authenticated_user();
+
+  if p_item_id is null then
+    raise exception using
+      errcode = '22004',
+      message = 'Item ID is required.';
+  end if;
+
+  select property_id, household_id, is_deleted
+  into
+    v_source_property_id,
+    v_source_household_id,
+    v_is_deleted
+  from public.items
+  where item_id = p_item_id;
+
+  if not found then
+    raise exception using
+      errcode = 'P0002',
+      message = 'Item not found.';
+  end if;
+
+  perform public.require_property_access(v_source_property_id);
+  perform public.require_property_access(p_target_property_id);
+
+  if v_is_deleted then
+    raise exception using
+      errcode = '55000',
+      message = 'Deleted items must be restored before they can be moved.';
+  end if;
+
+  select household_id
+  into v_target_household_id
+  from public.properties
+  where property_id = p_target_property_id;
+
+  if v_source_household_id <> v_target_household_id then
+    raise exception using
+      errcode = '22023',
+      message = 'Items cannot be moved between different households.';
+  end if;
+
+  if p_target_room_id is not null
+     and not exists (
+       select 1
+       from public.rooms
+       where room_id = p_target_room_id
+         and property_id = p_target_property_id
+     ) then
+    raise exception using
+      errcode = '22023',
+      message = 'The selected room does not belong to the target property.';
+  end if;
+
+  update public.items
+  set
+    property_id = p_target_property_id,
+    room_id = p_target_room_id
+  where item_id = p_item_id
+  returning *
+  into v_item;
+
+  return v_item;
+end;
+$$;
+
+
+-- ============================================================
+-- 4. SOFT DELETE ITEM
+--
+-- Hides an item without permanently removing its records,
+-- documents, maintenance history, or related information.
+-- ============================================================
+
+create or replace function public.soft_delete_item(
+  p_item_id uuid
+)
+returns public.items
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_user_id uuid;
+  v_property_id uuid;
+  v_item public.items;
+begin
+  v_user_id := public.require_authenticated_user();
+
+  if p_item_id is null then
+    raise exception using
+      errcode = '22004',
+      message = 'Item ID is required.';
+  end if;
+
+  select property_id
+  into v_property_id
+  from public.items
+  where item_id = p_item_id;
+
+  if not found then
+    raise exception using
+      errcode = 'P0002',
+      message = 'Item not found.';
+  end if;
+
+  perform public.require_property_access(v_property_id);
+
+  update public.items
+  set
+    is_deleted = true,
+    deleted_at = coalesce(deleted_at, now()),
+    deleted_by = coalesce(deleted_by, v_user_id)
+  where item_id = p_item_id
+  returning *
+  into v_item;
+
+  return v_item;
+end;
+$$;
+
+
+-- ============================================================
+-- 5. RESTORE ITEM
+--
+-- Restores a previously deleted inventory item.
+-- ============================================================
+
+create or replace function public.restore_item(
+  p_item_id uuid
+)
+returns public.items
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_property_id uuid;
+  v_item public.items;
+begin
+  perform public.require_authenticated_user();
+
+  if p_item_id is null then
+    raise exception using
+      errcode = '22004',
+      message = 'Item ID is required.';
+  end if;
+
+  select property_id
+  into v_property_id
+  from public.items
+  where item_id = p_item_id;
+
+  if not found then
+    raise exception using
+      errcode = 'P0002',
+      message = 'Item not found.';
+  end if;
+
+  perform public.require_property_access(v_property_id);
+
+  update public.items
+  set
+    is_deleted = false,
+    deleted_at = null,
+    deleted_by = null
+  where item_id = p_item_id
+  returning *
+  into v_item;
+
+  return v_item;
+end;
+$$;
+
+
+-- ============================================================
+-- 6. FUNCTION PERMISSIONS
+-- ============================================================
+
+revoke all on function public.create_item(
+  uuid,
+  text,
+  uuid,
+  text,
+  text,
+  text,
+  text,
+  date,
+  numeric,
+  text,
+  date,
+  date,
+  text,
+  text,
+  text,
+  numeric
+) from public;
+
+revoke all on function public.update_item(
+  uuid,
+  text,
+  text,
+  text,
+  text,
+  text,
+  date,
+  numeric,
+  text,
+  date,
+  date,
+  text,
+  text,
+  text,
+  numeric
+) from public;
+
+revoke all on function public.move_item(
+  uuid,
+  uuid,
+  uuid
+) from public;
+
+revoke all on function public.soft_delete_item(uuid)
+from public;
+
+revoke all on function public.restore_item(uuid)
+from public;
+
+
+grant execute on function public.create_item(
+  uuid,
+  text,
+  uuid,
+  text,
+  text,
+  text,
+  text,
+  date,
+  numeric,
+  text,
+  date,
+  date,
+  text,
+  text,
+  text,
+  numeric
+) to authenticated;
+
+grant execute on function public.update_item(
+  uuid,
+  text,
+  text,
+  text,
+  text,
+  text,
+  date,
+  numeric,
+  text,
+  date,
+  date,
+  text,
+  text,
+  text,
+  numeric
+) to authenticated;
+
+grant execute on function public.move_item(
+  uuid,
+  uuid,
+  uuid
+) to authenticated;
+
+grant execute on function public.soft_delete_item(uuid)
+to authenticated;
+
+grant execute on function public.restore_item(uuid)
+to authenticated;
+
+
+commit;
