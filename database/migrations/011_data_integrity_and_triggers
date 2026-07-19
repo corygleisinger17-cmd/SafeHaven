@@ -1,0 +1,351 @@
+begin;
+
+-- ============================================================
+-- SAFEHAVEN MIGRATION 011
+-- Data Integrity and Automatic Timestamp Triggers
+-- ============================================================
+
+
+-- ============================================================
+-- 1. ITEM DATA INTEGRITY
+-- ============================================================
+
+alter table public.items
+  drop constraint if exists items_purchase_price_nonnegative_check;
+
+alter table public.items
+  add constraint items_purchase_price_nonnegative_check
+  check (
+    purchase_price is null
+    or purchase_price >= 0
+  );
+
+
+alter table public.items
+  drop constraint if exists items_ai_confidence_score_check;
+
+alter table public.items
+  add constraint items_ai_confidence_score_check
+  check (
+    ai_confidence_score is null
+    or ai_confidence_score between 0 and 1
+  );
+
+
+alter table public.items
+  drop constraint if exists items_warranty_date_range_check;
+
+alter table public.items
+  add constraint items_warranty_date_range_check
+  check (
+    warranty_start is null
+    or warranty_expiration is null
+    or warranty_expiration >= warranty_start
+  );
+
+
+-- ============================================================
+-- 2. PROPERTY DATA INTEGRITY
+-- ============================================================
+
+alter table public.properties
+  drop constraint if exists properties_year_built_range_check;
+
+alter table public.properties
+  add constraint properties_year_built_range_check
+  check (
+    year_built is null
+    or year_built between 1700 and 2100
+  );
+
+
+-- ============================================================
+-- 3. MAINTENANCE DATA INTEGRITY
+-- ============================================================
+
+alter table public.maintenance_history
+  drop constraint if exists maintenance_cost_nonnegative_check;
+
+alter table public.maintenance_history
+  add constraint maintenance_cost_nonnegative_check
+  check (
+    cost is null
+    or cost >= 0
+  );
+
+
+-- ============================================================
+-- 4. SEARCH HISTORY DATA INTEGRITY
+-- ============================================================
+
+alter table public.search_history
+  drop constraint if exists search_history_result_count_check;
+
+alter table public.search_history
+  add constraint search_history_result_count_check
+  check (
+    result_count >= 0
+  );
+
+
+-- ============================================================
+-- 5. DOCUMENT DATA INTEGRITY
+-- ============================================================
+
+alter table public.documents
+  drop constraint if exists documents_file_url_not_blank_check;
+
+alter table public.documents
+  add constraint documents_file_url_not_blank_check
+  check (
+    length(btrim(file_url)) > 0
+  );
+
+
+-- ============================================================
+-- 6. REQUIRED NAME AND TITLE VALIDATION
+-- ============================================================
+
+alter table public.households
+  drop constraint if exists households_name_not_blank_check;
+
+alter table public.households
+  add constraint households_name_not_blank_check
+  check (
+    length(btrim(household_name)) > 0
+  );
+
+
+alter table public.properties
+  drop constraint if exists properties_name_not_blank_check;
+
+alter table public.properties
+  add constraint properties_name_not_blank_check
+  check (
+    length(btrim(property_name)) > 0
+  );
+
+
+alter table public.rooms
+  drop constraint if exists rooms_name_not_blank_check;
+
+alter table public.rooms
+  add constraint rooms_name_not_blank_check
+  check (
+    length(btrim(room_name)) > 0
+  );
+
+
+alter table public.items
+  drop constraint if exists items_name_not_blank_check;
+
+alter table public.items
+  add constraint items_name_not_blank_check
+  check (
+    length(btrim(item_name)) > 0
+  );
+
+
+alter table public.reminders
+  drop constraint if exists reminders_title_not_blank_check;
+
+alter table public.reminders
+  add constraint reminders_title_not_blank_check
+  check (
+    length(btrim(title)) > 0
+  );
+
+
+alter table public.maintenance_history
+  drop constraint if exists maintenance_action_not_blank_check;
+
+alter table public.maintenance_history
+  add constraint maintenance_action_not_blank_check
+  check (
+    length(btrim(action)) > 0
+  );
+
+
+alter table public.ai_insights
+  drop constraint if exists ai_insights_message_not_blank_check;
+
+alter table public.ai_insights
+  add constraint ai_insights_message_not_blank_check
+  check (
+    length(btrim(message)) > 0
+  );
+
+
+alter table public.search_history
+  drop constraint if exists search_history_query_not_blank_check;
+
+alter table public.search_history
+  add constraint search_history_query_not_blank_check
+  check (
+    length(btrim(query)) > 0
+  );
+
+
+-- ============================================================
+-- 7. DYNAMIC DATE VALIDATION
+--
+-- CURRENT_DATE should not be placed in a permanent CHECK
+-- constraint because it changes over time. These triggers perform
+-- date validation when a record is inserted or updated.
+-- ============================================================
+
+create or replace function public.validate_item_dates()
+returns trigger
+language plpgsql
+set search_path = pg_catalog, public
+as $$
+begin
+  if new.purchase_date is not null
+     and new.purchase_date > current_date + 1 then
+    raise exception
+      'Purchase date cannot be more than one day in the future.';
+  end if;
+
+  return new;
+end;
+$$;
+
+
+create or replace function public.validate_maintenance_dates()
+returns trigger
+language plpgsql
+set search_path = pg_catalog, public
+as $$
+begin
+  if new.completed_date is not null
+     and new.completed_date > current_date + 1 then
+    raise exception
+      'Maintenance completion date cannot be more than one day in the future.';
+  end if;
+
+  return new;
+end;
+$$;
+
+
+drop trigger if exists validate_item_dates_trigger
+  on public.items;
+
+create trigger validate_item_dates_trigger
+before insert or update of purchase_date
+on public.items
+for each row
+execute function public.validate_item_dates();
+
+
+drop trigger if exists validate_maintenance_dates_trigger
+  on public.maintenance_history;
+
+create trigger validate_maintenance_dates_trigger
+before insert or update of completed_date
+on public.maintenance_history
+for each row
+execute function public.validate_maintenance_dates();
+
+
+-- ============================================================
+-- 8. AUTOMATIC UPDATED_AT FUNCTION
+-- ============================================================
+
+create or replace function public.set_updated_at()
+returns trigger
+language plpgsql
+set search_path = pg_catalog, public
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+
+-- ============================================================
+-- 9. AUTOMATIC UPDATED_AT TRIGGERS
+-- ============================================================
+
+drop trigger if exists set_profiles_updated_at
+  on public.profiles;
+
+create trigger set_profiles_updated_at
+before update
+on public.profiles
+for each row
+execute function public.set_updated_at();
+
+
+drop trigger if exists set_households_updated_at
+  on public.households;
+
+create trigger set_households_updated_at
+before update
+on public.households
+for each row
+execute function public.set_updated_at();
+
+
+drop trigger if exists set_properties_updated_at
+  on public.properties;
+
+create trigger set_properties_updated_at
+before update
+on public.properties
+for each row
+execute function public.set_updated_at();
+
+
+drop trigger if exists set_rooms_updated_at
+  on public.rooms;
+
+create trigger set_rooms_updated_at
+before update
+on public.rooms
+for each row
+execute function public.set_updated_at();
+
+
+drop trigger if exists set_items_updated_at
+  on public.items;
+
+create trigger set_items_updated_at
+before update
+on public.items
+for each row
+execute function public.set_updated_at();
+
+
+drop trigger if exists set_reminders_updated_at
+  on public.reminders;
+
+create trigger set_reminders_updated_at
+before update
+on public.reminders
+for each row
+execute function public.set_updated_at();
+
+
+drop trigger if exists set_ai_insights_updated_at
+  on public.ai_insights;
+
+create trigger set_ai_insights_updated_at
+before update
+on public.ai_insights
+for each row
+execute function public.set_updated_at();
+
+
+drop trigger if exists set_setup_wizard_progress_updated_at
+  on public.setup_wizard_progress;
+
+create trigger set_setup_wizard_progress_updated_at
+before update
+on public.setup_wizard_progress
+for each row
+execute function public.set_updated_at();
+
+
+commit;
