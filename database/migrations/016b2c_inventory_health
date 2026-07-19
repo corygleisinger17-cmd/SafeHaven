@@ -1,0 +1,747 @@
+begin;
+
+-- ============================================================
+-- SAFEHAVEN MIGRATION 016B2C
+-- Inventory Health and Completeness Intelligence
+-- ============================================================
+
+
+-- ============================================================
+-- INVENTORY HEALTH
+--
+-- Calculates completeness scores for active inventory items.
+--
+-- Score components — 10 points each:
+--   1. Primary photo
+--   2. Brand
+--   3. Model number
+--   4. Serial number
+--   5. Purchase date
+--   6. Purchase price
+--   7. Vendor
+--   8. Warranty expiration
+--   9. Receipt document
+--  10. Manual document
+--
+-- Health levels:
+--   90–100 = excellent
+--   70–89  = good
+--   50–69  = needs_attention
+--   0–49   = incomplete
+-- ============================================================
+
+create or replace function public.inventory_health(
+  p_property_id uuid default null,
+  p_room_id uuid default null,
+  p_max_score integer default null,
+  p_sort_by text default 'score_asc',
+  p_limit_count integer default 100,
+  p_offset_count integer default 0
+)
+returns jsonb
+language plpgsql
+security definer
+stable
+set search_path = pg_catalog, public
+as $$
+declare
+  v_room_property_id uuid;
+
+  v_max_score integer;
+  v_limit integer;
+  v_offset integer;
+
+  v_total_count bigint;
+  v_average_score numeric;
+  v_excellent_count bigint;
+  v_good_count bigint;
+  v_needs_attention_count bigint;
+  v_incomplete_count bigint;
+
+  v_items jsonb;
+  v_returned_count integer;
+begin
+  -- ==========================================================
+  -- 1. AUTHENTICATION
+  -- ==========================================================
+
+  perform public.require_authenticated_user();
+
+
+  -- ==========================================================
+  -- 2. VALIDATE AND NORMALIZE PARAMETERS
+  -- ==========================================================
+
+  if p_max_score is not null then
+    v_max_score :=
+      least(
+        greatest(p_max_score, 0),
+        100
+      );
+  else
+    v_max_score := null;
+  end if;
+
+  v_limit :=
+    least(
+      greatest(coalesce(p_limit_count, 100), 1),
+      250
+    );
+
+  v_offset :=
+    greatest(coalesce(p_offset_count, 0), 0);
+
+  if coalesce(p_sort_by, '') not in (
+    'score_asc',
+    'score_desc',
+    'name_asc',
+    'name_desc',
+    'updated_asc',
+    'updated_desc'
+  ) then
+    raise exception using
+      errcode = '22023',
+      message = 'Invalid inventory health sort option.';
+  end if;
+
+
+  -- ==========================================================
+  -- 3. VALIDATE PROPERTY ACCESS
+  -- ==========================================================
+
+  if p_property_id is not null then
+    perform public.require_property_access(p_property_id);
+  end if;
+
+
+  -- ==========================================================
+  -- 4. VALIDATE ROOM ACCESS
+  -- ==========================================================
+
+  if p_room_id is not null then
+    select r.property_id
+    into v_room_property_id
+    from public.rooms r
+    where r.room_id = p_room_id;
+
+    if not found then
+      raise exception using
+        errcode = 'P0002',
+        message = 'Room not found.';
+    end if;
+
+    perform public.require_property_access(v_room_property_id);
+
+    if p_property_id is not null
+       and v_room_property_id <> p_property_id then
+      raise exception using
+        errcode = '22023',
+        message = 'The selected room does not belong to the selected property.';
+    end if;
+  end if;
+
+
+  -- ==========================================================
+  -- 5. CALCULATE INVENTORY HEALTH SUMMARY
+  -- ==========================================================
+
+  with item_health_base as (
+    select
+      i.item_id,
+
+      (
+        case
+          when nullif(btrim(i.primary_photo_url), '') is not null
+            then 10 else 0
+        end
+        +
+        case
+          when nullif(btrim(i.brand), '') is not null
+            then 10 else 0
+        end
+        +
+        case
+          when nullif(btrim(i.model_number), '') is not null
+            then 10 else 0
+        end
+        +
+        case
+          when nullif(btrim(i.serial_number), '') is not null
+            then 10 else 0
+        end
+        +
+        case
+          when i.purchase_date is not null
+            then 10 else 0
+        end
+        +
+        case
+          when i.purchase_price is not null
+            then 10 else 0
+        end
+        +
+        case
+          when nullif(btrim(i.vendor), '') is not null
+            then 10 else 0
+        end
+        +
+        case
+          when i.warranty_expiration is not null
+            then 10 else 0
+        end
+        +
+        case
+          when exists (
+            select 1
+            from public.documents d
+            where d.item_id = i.item_id
+              and lower(btrim(d.document_type)) in (
+                'receipt',
+                'purchase receipt',
+                'sales receipt'
+              )
+              and d.upload_status = 'uploaded'
+          )
+            then 10 else 0
+        end
+        +
+        case
+          when exists (
+            select 1
+            from public.documents d
+            where d.item_id = i.item_id
+              and lower(btrim(d.document_type)) in (
+                'manual',
+                'user manual',
+                'owner manual',
+                'owners manual',
+                'instruction manual'
+              )
+              and d.upload_status = 'uploaded'
+          )
+            then 10 else 0
+        end
+      )::integer as completeness_score
+
+    from public.items i
+
+    where public.is_household_member(i.household_id)
+      and i.is_deleted = false
+
+      and (
+        p_property_id is null
+        or i.property_id = p_property_id
+      )
+
+      and (
+        p_room_id is null
+        or i.room_id = p_room_id
+      )
+  ),
+
+  filtered_health as (
+    select *
+    from item_health_base
+    where v_max_score is null
+       or completeness_score <= v_max_score
+  )
+
+  select
+    count(*)::bigint,
+
+    coalesce(
+      round(avg(completeness_score), 1),
+      0
+    ),
+
+    count(*) filter (
+      where completeness_score >= 90
+    )::bigint,
+
+    count(*) filter (
+      where completeness_score between 70 and 89
+    )::bigint,
+
+    count(*) filter (
+      where completeness_score between 50 and 69
+    )::bigint,
+
+    count(*) filter (
+      where completeness_score < 50
+    )::bigint
+
+  into
+    v_total_count,
+    v_average_score,
+    v_excellent_count,
+    v_good_count,
+    v_needs_attention_count,
+    v_incomplete_count
+
+  from filtered_health;
+
+
+  -- ==========================================================
+  -- 6. BUILD ITEM-LEVEL HEALTH RESULTS
+  -- ==========================================================
+
+  with scored_items as (
+    select
+      i.item_id,
+      i.household_id,
+
+      i.property_id,
+      p.property_name,
+
+      i.room_id,
+      r.room_name,
+
+      i.item_name,
+      i.category,
+      i.brand,
+      i.model_number,
+      i.serial_number,
+
+      i.purchase_date,
+      i.purchase_price,
+      i.vendor,
+
+      i.warranty_start,
+      i.warranty_expiration,
+
+      i.primary_photo_url,
+      i.created_at,
+      i.updated_at,
+
+      exists (
+        select 1
+        from public.documents d
+        where d.item_id = i.item_id
+          and lower(btrim(d.document_type)) in (
+            'receipt',
+            'purchase receipt',
+            'sales receipt'
+          )
+          and d.upload_status = 'uploaded'
+      ) as has_receipt,
+
+      exists (
+        select 1
+        from public.documents d
+        where d.item_id = i.item_id
+          and lower(btrim(d.document_type)) in (
+            'manual',
+            'user manual',
+            'owner manual',
+            'owners manual',
+            'instruction manual'
+          )
+          and d.upload_status = 'uploaded'
+      ) as has_manual
+
+    from public.items i
+
+    join public.properties p
+      on p.property_id = i.property_id
+
+    left join public.rooms r
+      on r.room_id = i.room_id
+
+    where public.is_household_member(i.household_id)
+      and i.is_deleted = false
+
+      and (
+        p_property_id is null
+        or i.property_id = p_property_id
+      )
+
+      and (
+        p_room_id is null
+        or i.room_id = p_room_id
+      )
+  ),
+
+  calculated_items as (
+    select
+      scored_items.*,
+
+      (
+        case
+          when nullif(btrim(primary_photo_url), '') is not null
+            then 10 else 0
+        end
+        +
+        case
+          when nullif(btrim(brand), '') is not null
+            then 10 else 0
+        end
+        +
+        case
+          when nullif(btrim(model_number), '') is not null
+            then 10 else 0
+        end
+        +
+        case
+          when nullif(btrim(serial_number), '') is not null
+            then 10 else 0
+        end
+        +
+        case
+          when purchase_date is not null
+            then 10 else 0
+        end
+        +
+        case
+          when purchase_price is not null
+            then 10 else 0
+        end
+        +
+        case
+          when nullif(btrim(vendor), '') is not null
+            then 10 else 0
+        end
+        +
+        case
+          when warranty_expiration is not null
+            then 10 else 0
+        end
+        +
+        case
+          when has_receipt
+            then 10 else 0
+        end
+        +
+        case
+          when has_manual
+            then 10 else 0
+        end
+      )::integer as completeness_score
+
+    from scored_items
+  ),
+
+  filtered_items as (
+    select
+      calculated_items.*,
+
+      case
+        when completeness_score >= 90 then
+          'excellent'
+
+        when completeness_score >= 70 then
+          'good'
+
+        when completeness_score >= 50 then
+          'needs_attention'
+
+        else
+          'incomplete'
+      end as health_level,
+
+      array_remove(
+        array[
+          case
+            when nullif(btrim(primary_photo_url), '') is null
+              then 'primary_photo'
+          end,
+
+          case
+            when nullif(btrim(brand), '') is null
+              then 'brand'
+          end,
+
+          case
+            when nullif(btrim(model_number), '') is null
+              then 'model_number'
+          end,
+
+          case
+            when nullif(btrim(serial_number), '') is null
+              then 'serial_number'
+          end,
+
+          case
+            when purchase_date is null
+              then 'purchase_date'
+          end,
+
+          case
+            when purchase_price is null
+              then 'purchase_price'
+          end,
+
+          case
+            when nullif(btrim(vendor), '') is null
+              then 'vendor'
+          end,
+
+          case
+            when warranty_expiration is null
+              then 'warranty_information'
+          end,
+
+          case
+            when has_receipt = false
+              then 'receipt'
+          end,
+
+          case
+            when has_manual = false
+              then 'manual'
+          end
+        ],
+        null
+      ) as missing_fields
+
+    from calculated_items
+
+    where v_max_score is null
+       or completeness_score <= v_max_score
+  ),
+
+  paginated_items as (
+    select *
+    from filtered_items
+
+    order by
+      case
+        when p_sort_by = 'score_asc'
+          then completeness_score
+      end asc nulls last,
+
+      case
+        when p_sort_by = 'score_desc'
+          then completeness_score
+      end desc nulls last,
+
+      case
+        when p_sort_by = 'name_asc'
+          then lower(item_name)
+      end asc nulls last,
+
+      case
+        when p_sort_by = 'name_desc'
+          then lower(item_name)
+      end desc nulls last,
+
+      case
+        when p_sort_by = 'updated_asc'
+          then updated_at
+      end asc nulls last,
+
+      case
+        when p_sort_by = 'updated_desc'
+          then updated_at
+      end desc nulls last,
+
+      item_id asc
+
+    limit v_limit
+    offset v_offset
+  )
+
+  select coalesce(
+    jsonb_agg(
+      jsonb_build_object(
+        'item_id', item_id,
+        'household_id', household_id,
+
+        'property_id', property_id,
+        'property_name', property_name,
+
+        'room_id', room_id,
+        'room_name', room_name,
+
+        'item_name', item_name,
+        'category', category,
+        'brand', brand,
+        'model_number', model_number,
+        'serial_number', serial_number,
+
+        'purchase_date', purchase_date,
+        'purchase_price', purchase_price,
+        'vendor', vendor,
+
+        'warranty_start', warranty_start,
+        'warranty_expiration', warranty_expiration,
+
+        'primary_photo_url', primary_photo_url,
+
+        'completeness_score', completeness_score,
+        'health_level', health_level,
+        'completed_fields', completeness_score / 10,
+        'total_fields', 10,
+        'missing_count', cardinality(missing_fields),
+        'missing_fields', to_jsonb(missing_fields),
+
+        'completion', jsonb_build_object(
+          'primary_photo',
+            nullif(btrim(primary_photo_url), '') is not null,
+
+          'brand',
+            nullif(btrim(brand), '') is not null,
+
+          'model_number',
+            nullif(btrim(model_number), '') is not null,
+
+          'serial_number',
+            nullif(btrim(serial_number), '') is not null,
+
+          'purchase_date',
+            purchase_date is not null,
+
+          'purchase_price',
+            purchase_price is not null,
+
+          'vendor',
+            nullif(btrim(vendor), '') is not null,
+
+          'warranty_information',
+            warranty_expiration is not null,
+
+          'receipt',
+            has_receipt,
+
+          'manual',
+            has_manual
+        ),
+
+        'created_at', created_at,
+        'updated_at', updated_at
+      )
+      order by
+        case
+          when p_sort_by = 'score_asc'
+            then completeness_score
+        end asc nulls last,
+
+        case
+          when p_sort_by = 'score_desc'
+            then completeness_score
+        end desc nulls last,
+
+        case
+          when p_sort_by = 'name_asc'
+            then lower(item_name)
+        end asc nulls last,
+
+        case
+          when p_sort_by = 'name_desc'
+            then lower(item_name)
+        end desc nulls last,
+
+        case
+          when p_sort_by = 'updated_asc'
+            then updated_at
+        end asc nulls last,
+
+        case
+          when p_sort_by = 'updated_desc'
+            then updated_at
+        end desc nulls last,
+
+        item_id asc
+    ),
+    '[]'::jsonb
+  )
+  into v_items
+  from paginated_items;
+
+
+  -- ==========================================================
+  -- 7. STANDARDIZED RESPONSE
+  -- ==========================================================
+
+  v_returned_count := jsonb_array_length(v_items);
+
+  return jsonb_build_object(
+    'success', true,
+
+    'message',
+      case
+        when v_total_count = 0 then
+          'No inventory items matched the selected criteria.'
+
+        when v_average_score >= 90 then
+          'Inventory health is excellent.'
+
+        when v_average_score >= 70 then
+          'Inventory health is good.'
+
+        when v_average_score >= 50 then
+          'Some inventory records need attention.'
+
+        else
+          'Inventory records require additional information.'
+      end,
+
+    'count', v_total_count,
+    'returned_count', v_returned_count,
+
+    'summary', jsonb_build_object(
+      'average_score', v_average_score,
+      'excellent', v_excellent_count,
+      'good', v_good_count,
+      'needs_attention', v_needs_attention_count,
+      'incomplete', v_incomplete_count,
+      'items_below_70',
+        v_needs_attention_count + v_incomplete_count
+    ),
+
+    'pagination', jsonb_build_object(
+      'limit', v_limit,
+      'offset', v_offset,
+      'has_more',
+        (v_offset + v_returned_count) < v_total_count,
+      'next_offset',
+        case
+          when (v_offset + v_returned_count) < v_total_count then
+            v_offset + v_limit
+          else
+            null
+        end
+    ),
+
+    'filters', jsonb_build_object(
+      'property_id', p_property_id,
+      'room_id', p_room_id,
+      'maximum_score', v_max_score,
+      'sort_by', p_sort_by
+    ),
+
+    'scoring', jsonb_build_object(
+      'maximum_score', 100,
+      'points_per_field', 10,
+      'fields_evaluated', 10
+    ),
+
+    'data', v_items
+  );
+end;
+$$;
+
+
+-- ============================================================
+-- FUNCTION PERMISSIONS
+-- ============================================================
+
+revoke all on function public.inventory_health(
+  uuid,
+  uuid,
+  integer,
+  text,
+  integer,
+  integer
+) from public;
+
+grant execute on function public.inventory_health(
+  uuid,
+  uuid,
+  integer,
+  text,
+  integer,
+  integer
+) to authenticated;
+
+
+commit;
