@@ -1,0 +1,502 @@
+begin;
+
+-- ============================================================
+-- SAFEHAVEN MIGRATION 016B2B
+-- Warranty Intelligence
+-- ============================================================
+
+
+-- ============================================================
+-- EXPIRING WARRANTIES
+--
+-- Returns active inventory items with:
+--   • Already-expired warranties, when requested
+--   • Warranties expiring within the selected future window
+--
+-- Results include:
+--   • Days remaining
+--   • Warranty status
+--   • Priority
+--   • Dashboard summary counts
+--   • Pagination metadata
+--
+-- p_property_id:
+--   Optional property filter.
+--
+-- p_room_id:
+--   Optional room filter.
+--
+-- p_days_ahead:
+--   Number of future days to include. Maximum: 730 days.
+--
+-- p_include_expired:
+--   Whether already-expired warranties should be returned.
+--
+-- p_limit_count / p_offset_count:
+--   Pagination controls.
+-- ============================================================
+
+create or replace function public.expiring_warranties(
+  p_property_id uuid default null,
+  p_room_id uuid default null,
+  p_days_ahead integer default 90,
+  p_include_expired boolean default true,
+  p_limit_count integer default 100,
+  p_offset_count integer default 0
+)
+returns jsonb
+language plpgsql
+security definer
+stable
+set search_path = pg_catalog, public
+as $$
+declare
+  v_room_property_id uuid;
+
+  v_days_ahead integer;
+  v_limit integer;
+  v_offset integer;
+
+  v_total_count bigint;
+  v_expired_count bigint;
+  v_expiring_30_count bigint;
+  v_expiring_31_60_count bigint;
+  v_expiring_61_90_count bigint;
+  v_expiring_later_count bigint;
+
+  v_items jsonb;
+  v_returned_count integer;
+begin
+  -- ==========================================================
+  -- 1. AUTHENTICATION
+  -- ==========================================================
+
+  perform public.require_authenticated_user();
+
+
+  -- ==========================================================
+  -- 2. NORMALIZE PAGINATION AND DATE WINDOW
+  -- ==========================================================
+
+  v_days_ahead :=
+    least(
+      greatest(coalesce(p_days_ahead, 90), 0),
+      730
+    );
+
+  v_limit :=
+    least(
+      greatest(coalesce(p_limit_count, 100), 1),
+      250
+    );
+
+  v_offset :=
+    greatest(coalesce(p_offset_count, 0), 0);
+
+
+  -- ==========================================================
+  -- 3. VALIDATE PROPERTY ACCESS
+  -- ==========================================================
+
+  if p_property_id is not null then
+    perform public.require_property_access(p_property_id);
+  end if;
+
+
+  -- ==========================================================
+  -- 4. VALIDATE ROOM ACCESS AND PROPERTY RELATIONSHIP
+  -- ==========================================================
+
+  if p_room_id is not null then
+    select r.property_id
+    into v_room_property_id
+    from public.rooms r
+    where r.room_id = p_room_id;
+
+    if not found then
+      raise exception using
+        errcode = 'P0002',
+        message = 'Room not found.';
+    end if;
+
+    perform public.require_property_access(v_room_property_id);
+
+    if p_property_id is not null
+       and v_room_property_id <> p_property_id then
+      raise exception using
+        errcode = '22023',
+        message = 'The selected room does not belong to the selected property.';
+    end if;
+  end if;
+
+
+  -- ==========================================================
+  -- 5. CALCULATE SUMMARY COUNTS
+  --
+  -- Buckets are mutually exclusive:
+  --   expired
+  --   0–30 days
+  --   31–60 days
+  --   61–90 days
+  --   91+ days within selected window
+  -- ==========================================================
+
+  select
+    count(*)::bigint,
+
+    count(*) filter (
+      where i.warranty_expiration < current_date
+    )::bigint,
+
+    count(*) filter (
+      where i.warranty_expiration >= current_date
+        and i.warranty_expiration <= current_date + 30
+    )::bigint,
+
+    count(*) filter (
+      where i.warranty_expiration > current_date + 30
+        and i.warranty_expiration <= current_date + 60
+    )::bigint,
+
+    count(*) filter (
+      where i.warranty_expiration > current_date + 60
+        and i.warranty_expiration <= current_date + 90
+    )::bigint,
+
+    count(*) filter (
+      where i.warranty_expiration > current_date + 90
+        and i.warranty_expiration
+            <= current_date + v_days_ahead
+    )::bigint
+
+  into
+    v_total_count,
+    v_expired_count,
+    v_expiring_30_count,
+    v_expiring_31_60_count,
+    v_expiring_61_90_count,
+    v_expiring_later_count
+
+  from public.items i
+  where public.is_household_member(i.household_id)
+    and i.is_deleted = false
+    and i.warranty_expiration is not null
+
+    and (
+      p_property_id is null
+      or i.property_id = p_property_id
+    )
+
+    and (
+      p_room_id is null
+      or i.room_id = p_room_id
+    )
+
+    and (
+      (
+        p_include_expired = true
+        and i.warranty_expiration < current_date
+      )
+      or (
+        i.warranty_expiration >= current_date
+        and i.warranty_expiration
+            <= current_date + v_days_ahead
+      )
+    );
+
+
+  -- ==========================================================
+  -- 6. FETCH WARRANTY RECORDS
+  -- ==========================================================
+
+  with warranty_items as (
+    select
+      i.item_id,
+      i.household_id,
+
+      i.property_id,
+      p.property_name,
+
+      i.room_id,
+      r.room_name,
+
+      i.item_name,
+      i.category,
+      i.brand,
+      i.model_number,
+      i.serial_number,
+
+      i.purchase_date,
+      i.purchase_price,
+      i.vendor,
+
+      i.warranty_start,
+      i.warranty_expiration,
+
+      (
+        i.warranty_expiration - current_date
+      )::integer as days_remaining,
+
+      case
+        when i.warranty_expiration < current_date then
+          'expired'
+
+        when i.warranty_expiration = current_date then
+          'expires_today'
+
+        when i.warranty_expiration <= current_date + 30 then
+          'expiring_soon'
+
+        when i.warranty_expiration <= current_date + 60 then
+          'upcoming'
+
+        when i.warranty_expiration <= current_date + 90 then
+          'future'
+
+        else
+          'active'
+      end as warranty_status,
+
+      case
+        when i.warranty_expiration < current_date then
+          'critical'
+
+        when i.warranty_expiration <= current_date + 30 then
+          'high'
+
+        when i.warranty_expiration <= current_date + 60 then
+          'medium'
+
+        when i.warranty_expiration <= current_date + 90 then
+          'low'
+
+        else
+          'informational'
+      end as priority,
+
+      case
+        when i.warranty_expiration < current_date then
+          1
+
+        when i.warranty_expiration <= current_date + 30 then
+          2
+
+        when i.warranty_expiration <= current_date + 60 then
+          3
+
+        when i.warranty_expiration <= current_date + 90 then
+          4
+
+        else
+          5
+      end as priority_rank,
+
+      i.primary_photo_url,
+      i.notes,
+      i.created_at,
+      i.updated_at
+
+    from public.items i
+
+    join public.properties p
+      on p.property_id = i.property_id
+
+    left join public.rooms r
+      on r.room_id = i.room_id
+
+    where public.is_household_member(i.household_id)
+      and i.is_deleted = false
+      and i.warranty_expiration is not null
+
+      and (
+        p_property_id is null
+        or i.property_id = p_property_id
+      )
+
+      and (
+        p_room_id is null
+        or i.room_id = p_room_id
+      )
+
+      and (
+        (
+          p_include_expired = true
+          and i.warranty_expiration < current_date
+        )
+        or (
+          i.warranty_expiration >= current_date
+          and i.warranty_expiration
+              <= current_date + v_days_ahead
+        )
+      )
+
+    order by
+      priority_rank asc,
+      i.warranty_expiration asc,
+      lower(i.item_name) asc,
+      i.item_id asc
+
+    limit v_limit
+    offset v_offset
+  )
+
+  select coalesce(
+    jsonb_agg(
+      jsonb_build_object(
+        'item_id', item_id,
+        'household_id', household_id,
+
+        'property_id', property_id,
+        'property_name', property_name,
+
+        'room_id', room_id,
+        'room_name', room_name,
+
+        'item_name', item_name,
+        'category', category,
+        'brand', brand,
+        'model_number', model_number,
+        'serial_number', serial_number,
+
+        'purchase_date', purchase_date,
+        'purchase_price', purchase_price,
+        'vendor', vendor,
+
+        'warranty_start', warranty_start,
+        'warranty_expiration', warranty_expiration,
+        'days_remaining', days_remaining,
+        'warranty_status', warranty_status,
+        'priority', priority,
+        'priority_rank', priority_rank,
+
+        'display_message',
+          case
+            when days_remaining < -1 then
+              'Warranty expired '
+              || abs(days_remaining)
+              || ' days ago.'
+
+            when days_remaining = -1 then
+              'Warranty expired yesterday.'
+
+            when days_remaining = 0 then
+              'Warranty expires today.'
+
+            when days_remaining = 1 then
+              'Warranty expires tomorrow.'
+
+            else
+              'Warranty expires in '
+              || days_remaining
+              || ' days.'
+          end,
+
+        'primary_photo_url', primary_photo_url,
+        'notes', notes,
+        'created_at', created_at,
+        'updated_at', updated_at
+      )
+      order by
+        priority_rank asc,
+        warranty_expiration asc,
+        lower(item_name) asc,
+        item_id asc
+    ),
+    '[]'::jsonb
+  )
+  into v_items
+  from warranty_items;
+
+
+  -- ==========================================================
+  -- 7. STANDARDIZED RESPONSE
+  -- ==========================================================
+
+  v_returned_count := jsonb_array_length(v_items);
+
+  return jsonb_build_object(
+    'success', true,
+
+    'message',
+      case
+        when v_total_count = 0 then
+          'No warranties matched the selected criteria.'
+
+        when v_expired_count > 0
+          and p_include_expired = true then
+          'Warranty issues require attention.'
+
+        when v_expiring_30_count > 0 then
+          'One or more warranties expire within 30 days.'
+
+        else
+          'Warranty review completed successfully.'
+      end,
+
+    'count', v_total_count,
+    'returned_count', v_returned_count,
+
+    'summary', jsonb_build_object(
+      'total', v_total_count,
+      'expired', v_expired_count,
+      'expiring_0_to_30_days', v_expiring_30_count,
+      'expiring_31_to_60_days', v_expiring_31_60_count,
+      'expiring_61_to_90_days', v_expiring_61_90_count,
+      'expiring_after_90_days', v_expiring_later_count,
+      'requires_attention',
+        v_expired_count
+        + v_expiring_30_count
+    ),
+
+    'pagination', jsonb_build_object(
+      'limit', v_limit,
+      'offset', v_offset,
+      'has_more',
+        (v_offset + v_returned_count) < v_total_count,
+      'next_offset',
+        case
+          when (v_offset + v_returned_count) < v_total_count then
+            v_offset + v_limit
+          else
+            null
+        end
+    ),
+
+    'filters', jsonb_build_object(
+      'property_id', p_property_id,
+      'room_id', p_room_id,
+      'days_ahead', v_days_ahead,
+      'include_expired', p_include_expired,
+      'as_of_date', current_date
+    ),
+
+    'data', v_items
+  );
+end;
+$$;
+
+
+-- ============================================================
+-- FUNCTION PERMISSIONS
+-- ============================================================
+
+revoke all on function public.expiring_warranties(
+  uuid,
+  uuid,
+  integer,
+  boolean,
+  integer,
+  integer
+) from public;
+
+grant execute on function public.expiring_warranties(
+  uuid,
+  uuid,
+  integer,
+  boolean,
+  integer,
+  integer
+) to authenticated;
+
+
+commit;
