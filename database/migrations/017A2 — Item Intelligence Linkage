@@ -1,0 +1,43 @@
+--------------------------------------------------------------------------------
+-- 017A2 — Item Intelligence Linkage
+-- Step 1: Create the current item intelligence table
+--------------------------------------------------------------------------------
+
+create table if not exists public.item_intelligence (
+    item_intelligence_id uuid primary key default gen_random_uuid(),
+
+    item_id uuid not null,
+    manufacturer_id uuid,
+    item_type_id uuid,
+
+    classification_confidence numeric(5,2),
+
+    classified_at timestamptz,
+
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+
+    constraint item_intelligence_item_fk
+        foreign key (item_id)
+        references public.items (item_id)
+        on delete cascade,
+
+    constraint item_intelligence_manufacturer_fk
+        foreign key (manufacturer_id)
+        references reference.manufacturers (manufacturer_id)
+        on delete set null,
+
+    constraint item_intelligence_item_type_fk
+        foreign key (item_type_id)
+        references reference.item_types (item_type_id)
+        on delete set null,
+
+    constraint item_intelligence_one_record_per_item
+        unique (item_id),
+
+    constraint item_intelligence_confidence_range
+        check (
+            classification_confidence is null
+            or classification_confidence between 0 and 100
+        )
+);
