@@ -94,3 +94,44 @@ ON public.item_intelligence (item_type_id);
 -- Fast lookup by confidence
 CREATE INDEX IF NOT EXISTS idx_item_intelligence_confidence
 ON public.item_intelligence (classification_confidence);
+
+
+--------------------------------------------------------------------------------
+-- Step 4A: Automatically create an intelligence record
+--------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.create_item_intelligence()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+
+    INSERT INTO public.item_intelligence (
+        item_id,
+        created_at,
+        updated_at
+    )
+    VALUES (
+        NEW.item_id,
+        NOW(),
+        NOW()
+    );
+
+    RETURN NEW;
+
+END;
+$$;
+
+
+--------------------------------------------------------------------------------
+-- Step 4B: Trigger
+--------------------------------------------------------------------------------
+
+DROP TRIGGER IF EXISTS trg_create_item_intelligence
+ON public.items;
+
+CREATE TRIGGER trg_create_item_intelligence
+AFTER INSERT
+ON public.items
+FOR EACH ROW
+EXECUTE FUNCTION public.create_item_intelligence();
