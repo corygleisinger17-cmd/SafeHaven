@@ -40,7 +40,14 @@ intelligence capabilities including:
 
 The engine is designed to augment—not replace—human decision making.
 
-No recommendation is permanently stored without user approval.
+Recommendations are persisted as suggestion records for review,
+auditability, versioning, and future reprocessing.
+
+Persisting a suggestion does not modify the item's accepted
+classification.
+
+Only explicit user approval may apply a suggestion through the
+classification workflow.
 
 ==================================================
 
