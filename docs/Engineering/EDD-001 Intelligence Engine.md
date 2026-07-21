@@ -68,11 +68,15 @@ The same input shall always produce the same output.
 
 --------------------------------------------------
 
-3. Read Only
+3. Classification Safe
 
-The engine never modifies user data.
+The engine may create and manage suggestion records.
 
-It only produces recommendations.
+The engine must never modify an item's accepted Manufacturer or
+Item Type classification without explicit user approval.
+
+Suggestion generation and classification application remain
+separate operations.
 
 --------------------------------------------------
 
