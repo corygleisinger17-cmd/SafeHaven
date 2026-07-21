@@ -230,3 +230,222 @@ BEGIN
 END;
 
 $$;
+
+
+--------------------------------------------------------------------------------
+-- Step 5B: Harden classify_item() with validation and upsert
+--------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.classify_item(
+    p_item_id uuid,
+    p_manufacturer_id uuid,
+    p_item_type_id uuid,
+    p_classification_confidence numeric(5,2)
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, reference
+AS $$
+BEGIN
+    --------------------------------------------------------------------------
+    -- Validate confidence
+    --------------------------------------------------------------------------
+    IF p_classification_confidence IS NOT NULL
+       AND (
+           p_classification_confidence < 0
+           OR p_classification_confidence > 100
+       )
+    THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'message', 'Classification confidence must be between 0 and 100.'
+        );
+    END IF;
+
+    --------------------------------------------------------------------------
+    -- Validate inventory item
+    --------------------------------------------------------------------------
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.items
+        WHERE item_id = p_item_id
+    )
+    THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'message', 'Item not found.'
+        );
+    END IF;
+
+    --------------------------------------------------------------------------
+    -- Validate manufacturer
+    --------------------------------------------------------------------------
+    IF p_manufacturer_id IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1
+           FROM reference.manufacturers
+           WHERE manufacturer_id = p_manufacturer_id
+       )
+    THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'message', 'Manufacturer not found.'
+        );
+    END IF;
+
+    --------------------------------------------------------------------------
+    -- Validate item type
+    --------------------------------------------------------------------------
+    IF p_item_type_id IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1
+           FROM reference.item_types
+           WHERE item_type_id = p_item_type_id
+       )
+    THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'message', 'Item type not found.'
+        );
+    END IF;
+
+    --------------------------------------------------------------------------
+    -- Insert or update item intelligence
+    --------------------------------------------------------------------------
+    INSERT INTO public.item_intelligence (
+        item_id,
+        manufacturer_id,
+        item_type_id,
+        classification_confidence,
+        classified_at,
+        created_at,
+        updated_at
+    )
+    VALUES (
+        p_item_id,
+        p_manufacturer_id,
+        p_item_type_id,
+        p_classification_confidence,
+        now(),
+        now(),
+        now()
+    )
+    ON CONFLICT (item_id)
+    DO UPDATE SET
+        manufacturer_id = EXCLUDED.manufacturer_id,
+        item_type_id = EXCLUDED.item_type_id,
+        classification_confidence = EXCLUDED.classification_confidence,
+        classified_at = now(),
+        updated_at = now();
+
+    --------------------------------------------------------------------------
+    -- Return success
+    --------------------------------------------------------------------------
+    RETURN jsonb_build_object(
+        'success', true,
+        'message', 'Item classified successfully.',
+        'item_id', p_item_id,
+        'manufacturer_id', p_manufacturer_id,
+        'item_type_id', p_item_type_id,
+        'classification_confidence', p_classification_confidence
+    );
+
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'message', 'Unable to classify item.',
+            'error', SQLERRM
+        );
+END;
+$$;
+
+
+--------------------------------------------------------------------------------
+-- Step 6: get_item_intelligence()
+--------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.get_item_intelligence(
+    p_item_id uuid
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, reference
+AS $$
+DECLARE
+    v_result jsonb;
+BEGIN
+    --------------------------------------------------------------------------
+    -- Validate item
+    --------------------------------------------------------------------------
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.items
+        WHERE item_id = p_item_id
+    )
+    THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'message', 'Item not found.'
+        );
+    END IF;
+
+    --------------------------------------------------------------------------
+    -- Build intelligence response
+    --------------------------------------------------------------------------
+    SELECT jsonb_build_object(
+        'success', true,
+        'message', 'Item intelligence retrieved successfully.',
+        'data', jsonb_build_object(
+            'item_intelligence_id', ii.item_intelligence_id,
+            'item_id', ii.item_id,
+            'manufacturer_id', ii.manufacturer_id,
+            'manufacturer_name', m.manufacturer_name,
+            'item_type_id', ii.item_type_id,
+            'item_type_name', it.item_type_name,
+            'classification_confidence', ii.classification_confidence,
+            'classified_at', ii.classified_at,
+            'created_at', ii.created_at,
+            'updated_at', ii.updated_at
+        )
+    )
+    INTO v_result
+    FROM public.item_intelligence ii
+    LEFT JOIN reference.manufacturers m
+        ON m.manufacturer_id = ii.manufacturer_id
+    LEFT JOIN reference.item_types it
+        ON it.item_type_id = ii.item_type_id
+    WHERE ii.item_id = p_item_id;
+
+    --------------------------------------------------------------------------
+    -- Handle item with no intelligence record
+    --------------------------------------------------------------------------
+    IF v_result IS NULL THEN
+        RETURN jsonb_build_object(
+            'success', true,
+            'message', 'Item exists but has not been classified.',
+            'data', jsonb_build_object(
+                'item_id', p_item_id,
+                'manufacturer_id', NULL,
+                'manufacturer_name', NULL,
+                'item_type_id', NULL,
+                'item_type_name', NULL,
+                'classification_confidence', NULL,
+                'classified_at', NULL
+            )
+        );
+    END IF;
+
+    RETURN v_result;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'message', 'Unable to retrieve item intelligence.',
+            'error', SQLERRM
+        );
+END;
+$$;
