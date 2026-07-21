@@ -135,3 +135,98 @@ AFTER INSERT
 ON public.items
 FOR EACH ROW
 EXECUTE FUNCTION public.create_item_intelligence();
+
+
+--------------------------------------------------------------------------------
+-- Step 5A: classify_item()
+--------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.classify_item(
+
+    p_item_id uuid,
+
+    p_manufacturer_id uuid,
+
+    p_item_type_id uuid,
+
+    p_classification_confidence smallint
+
+)
+
+RETURNS jsonb
+
+LANGUAGE plpgsql
+
+SECURITY DEFINER
+
+AS $$
+
+DECLARE
+
+    v_exists boolean;
+
+BEGIN
+
+    --------------------------------------------------------------------------
+    -- Verify the item exists
+    --------------------------------------------------------------------------
+
+    SELECT EXISTS (
+
+        SELECT 1
+        FROM public.items
+        WHERE item_id = p_item_id
+
+    )
+
+    INTO v_exists;
+
+    IF NOT v_exists THEN
+
+        RETURN jsonb_build_object(
+
+            'success', false,
+
+            'message', 'Item not found.'
+
+        );
+
+    END IF;
+
+    --------------------------------------------------------------------------
+    -- Update the intelligence record
+    --------------------------------------------------------------------------
+
+    UPDATE public.item_intelligence
+
+    SET
+
+        manufacturer_id = p_manufacturer_id,
+
+        item_type_id = p_item_type_id,
+
+        classification_confidence = p_classification_confidence,
+
+        classified_at = now(),
+
+        updated_at = now()
+
+    WHERE item_id = p_item_id;
+
+    --------------------------------------------------------------------------
+    -- Success
+    --------------------------------------------------------------------------
+
+    RETURN jsonb_build_object(
+
+        'success', true,
+
+        'message', 'Item classified successfully.',
+
+        'item_id', p_item_id
+
+    );
+
+END;
+
+$$;
