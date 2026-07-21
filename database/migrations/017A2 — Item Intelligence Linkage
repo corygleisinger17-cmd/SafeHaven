@@ -449,3 +449,132 @@ EXCEPTION
         );
 END;
 $$;
+
+
+
+--------------------------------------------------------------------------------
+-- Step 7A: Enable Row Level Security
+--------------------------------------------------------------------------------
+
+ALTER TABLE public.item_intelligence
+ENABLE ROW LEVEL SECURITY;
+
+
+--------------------------------------------------------------------------------
+-- Step 7B: Read Policy
+--------------------------------------------------------------------------------
+
+CREATE POLICY "Members can read item intelligence"
+ON public.item_intelligence
+FOR SELECT
+USING (
+    EXISTS (
+        SELECT 1
+        FROM public.items i
+        WHERE i.item_id = item_intelligence.item_id
+          AND is_household_member(i.household_id)
+    )
+);
+
+
+--------------------------------------------------------------------------------
+-- Step 7C: Update Policy
+--------------------------------------------------------------------------------
+
+CREATE POLICY "Members can update item intelligence"
+ON public.item_intelligence
+FOR UPDATE
+USING (
+    EXISTS (
+        SELECT 1
+        FROM public.items i
+        WHERE i.item_id = item_intelligence.item_id
+          AND is_household_member(i.household_id)
+    )
+);
+
+
+--------------------------------------------------------------------------------
+-- Step 7D: Insert Policy
+--------------------------------------------------------------------------------
+
+CREATE POLICY "Members can insert item intelligence"
+ON public.item_intelligence
+FOR INSERT
+WITH CHECK (
+    EXISTS (
+        SELECT 1
+        FROM public.items i
+        WHERE i.item_id = item_intelligence.item_id
+          AND is_household_member(i.household_id)
+    )
+);
+
+
+--------------------------------------------------------------------------------
+-- Step 8A: Manufacturer Aliases
+--------------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS reference.manufacturer_aliases
+(
+    manufacturer_alias_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    manufacturer_id uuid NOT NULL
+        REFERENCES reference.manufacturers(manufacturer_id)
+        ON DELETE CASCADE,
+
+    alias_name text NOT NULL,
+
+    is_primary boolean NOT NULL DEFAULT false,
+
+    created_at timestamptz NOT NULL DEFAULT now(),
+
+    updated_at timestamptz NOT NULL DEFAULT now(),
+
+    CONSTRAINT uq_manufacturer_alias UNIQUE(alias_name)
+);
+
+COMMENT ON TABLE reference.manufacturer_aliases IS
+'Alternative manufacturer names used to normalize user-entered brand values.';
+
+
+--------------------------------------------------------------------------------
+-- Step 8B: Indexes
+--------------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_manufacturer_alias_name
+ON reference.manufacturer_aliases(alias_name);
+
+CREATE INDEX IF NOT EXISTS idx_manufacturer_alias_manufacturer
+ON reference.manufacturer_aliases(manufacturer_id);
+
+
+--------------------------------------------------------------------------------
+-- Generic updated_at trigger function
+--------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$;
+
+
+--------------------------------------------------------------------------------
+-- updated_at trigger for manufacturer_aliases
+--------------------------------------------------------------------------------
+
+DROP TRIGGER IF EXISTS trg_manufacturer_aliases_updated_at
+ON reference.manufacturer_aliases;
+
+CREATE TRIGGER trg_manufacturer_aliases_updated_at
+BEFORE UPDATE
+ON reference.manufacturer_aliases
+FOR EACH ROW
+EXECUTE FUNCTION public.set_updated_at();
+
+
