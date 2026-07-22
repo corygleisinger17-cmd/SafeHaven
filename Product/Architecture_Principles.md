@@ -90,7 +90,7 @@ Every piece of information should have exactly one authoritative location.
 
 ### Examples
 
-One inventory record.
+One Assets record.
 
 One warranty record.
 
@@ -223,7 +223,7 @@ Modules should communicate through well-defined interfaces.
 
 Examples
 
-Inventory
+Assets
 
 Documents
 
@@ -245,7 +245,7 @@ Each should evolve independently.
 
 ### Principle
 
-Architecture decisions should support millions of inventory records without significant redesign.
+Architecture decisions should support millions of Assets records without significant redesign.
 
 Performance should be considered during initial design rather than after deployment.
 
