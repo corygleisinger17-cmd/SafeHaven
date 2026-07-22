@@ -48,7 +48,7 @@ Household
 │
 ├── Rooms
 │
-├── Inventory
+├── Asset
 │     ├── Categories
 │     ├── Documents
 │     ├── Photos
@@ -118,7 +118,7 @@ Rooms provide organization and search capabilities.
 
 ---
 
-## Inventory
+## Asset
 
 Represents every owned asset.
 
@@ -131,13 +131,13 @@ Examples
 - Smoke Detector
 - Air Compressor
 
-Inventory is one of the primary domains within SafeHaven.
+Asset is one of the primary domains within SafeHaven.
 
 ---
 
 ## Category
 
-Categories organize inventory.
+Categories organize Asset.
 
 Examples
 
@@ -154,7 +154,7 @@ Categories simplify browsing and search.
 
 ## Document
 
-Represents information associated with an inventory item.
+Represents information associated with an Assets.
 
 Document Types
 
@@ -165,13 +165,13 @@ Document Types
 - Insurance
 - Certificate
 
-Documents should always be associated with an inventory item whenever practical.
+Documents should always be associated with an Assets whenever practical.
 
 ---
 
 ## Photo
 
-Represents images associated with an inventory item.
+Represents images associated with an Assets.
 
 Examples
 
@@ -308,7 +308,7 @@ Household
     │
     ├── Rooms
     │
-    ├── Inventory Items
+    ├── Assetss
     │      │
     │      ├── Category
     │      ├── Photos
@@ -336,9 +336,9 @@ Everything belongs to exactly one Household.
 
 ## Rule 002
 
-Inventory Items are the center of the ownership model.
+Assetss are the center of the ownership model.
 
-Most information should connect to an Inventory Item.
+Most information should connect to an Assets.
 
 ---
 
@@ -346,7 +346,7 @@ Most information should connect to an Inventory Item.
 
 Documents should not exist independently without a business purpose.
 
-Whenever practical, every document should be linked to an Inventory Item.
+Whenever practical, every document should be linked to an Assets.
 
 ---
 
@@ -360,7 +360,7 @@ Users approve changes.
 
 ## Rule 005
 
-Maintenance belongs to Inventory Items.
+Maintenance belongs to Assetss.
 
 Completed maintenance becomes permanent history.
 
